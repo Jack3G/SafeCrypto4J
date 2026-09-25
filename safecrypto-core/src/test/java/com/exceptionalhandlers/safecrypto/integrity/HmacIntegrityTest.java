@@ -13,6 +13,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 
+@DisplayName("HmacIntegrity")
 class HmacIntegrityTest {
   /** predictable key material for testing */
   private static final byte[] KEY_MATERIAL =
@@ -44,7 +45,8 @@ class HmacIntegrityTest {
   @Test
   @DisplayName("ensures that null key material isn't accepted")
   void keyMaterialMustNotBeNull() {
-    assertThatThrownBy(() -> HmacIntegrity.Key.of(null)).isInstanceOf(NullPointerException.class);
+    assertThatThrownBy(() -> HmacIntegrity.Key.of(null))
+        .isInstanceOf(IllegalArgumentException.class);
   }
 
   @Nested
@@ -69,49 +71,53 @@ class HmacIntegrityTest {
     @DisplayName("checks that key material cant be modified after key creation")
     void keyMaterialIsDefensivelyCopiedOnCreation() {
       byte[] original = KEY_MATERIAL.clone();
-      HmacIntegrity.Key key = HmacIntegrity.Key.of(original);
 
-      byte[] expectedBeforeMutation =
-          HmacIntegrity.sign(HmacIntegrity.Algorithm.SHA256, key, MESSAGE);
+      try (HmacIntegrity.Key key = HmacIntegrity.Key.of(original)) {
 
-      Arrays.fill(original, (byte) 0x7f);
+        byte[] expectedBeforeMutation =
+            HmacIntegrity.sign(key, MESSAGE, HmacIntegrity.Algorithm.SHA256);
 
-      byte[] actualAfterMutation = HmacIntegrity.sign(HmacIntegrity.Algorithm.SHA256, key, MESSAGE);
+        Arrays.fill(original, (byte) 0x7f);
 
-      assertThat(actualAfterMutation).containsExactly(expectedBeforeMutation);
+        byte[] actualAfterMutation =
+            HmacIntegrity.sign(key, MESSAGE, HmacIntegrity.Algorithm.SHA256);
 
-      key.close();
+        assertThat(actualAfterMutation).containsExactly(expectedBeforeMutation);
+      }
     }
 
     @Test
     @DisplayName("checks that generateKey() generates a key that is usable")
     void generatedKeyCanBeUsedForSigning() {
-      HmacIntegrity.Key key = HmacIntegrity.generateKey();
+      try (HmacIntegrity.Key key = HmacIntegrity.generateKey()) {
 
-      try {
-        byte[] tag = HmacIntegrity.sign(HmacIntegrity.Algorithm.SHA256, key, MESSAGE);
+        byte[] tag = HmacIntegrity.sign(key, MESSAGE, HmacIntegrity.Algorithm.SHA256);
 
         assertThat(tag).isNotNull().hasSize(32);
-      } finally {
-        key.close();
       }
     }
 
     @Test
     @DisplayName("checks that generateKey() generates unique keys")
     void generatedKeysAreNotAlwaysIdentical() {
-      HmacIntegrity.Key first = HmacIntegrity.generateKey();
-      HmacIntegrity.Key second = HmacIntegrity.generateKey();
+      try (HmacIntegrity.Key first = HmacIntegrity.generateKey();
+          HmacIntegrity.Key second = HmacIntegrity.generateKey()) {
 
-      try {
-        byte[] firstTag = HmacIntegrity.sign(HmacIntegrity.Algorithm.SHA256, first, MESSAGE);
-        byte[] secondTag = HmacIntegrity.sign(HmacIntegrity.Algorithm.SHA256, second, MESSAGE);
+        byte[] firstTag = HmacIntegrity.sign(first, MESSAGE, HmacIntegrity.Algorithm.SHA256);
+        byte[] secondTag = HmacIntegrity.sign(second, MESSAGE, HmacIntegrity.Algorithm.SHA256);
 
         assertThat(MessageDigest.isEqual(firstTag, secondTag)).isFalse();
-      } finally {
-        first.close();
-        second.close();
       }
+    }
+
+    @Test
+    @DisplayName("check that closed keys throw when used")
+    void closedKeyCannotExposeMaterial() {
+      HmacIntegrity.Key key = HmacIntegrity.Key.of(KEY_MATERIAL);
+
+      key.close();
+
+      assertThatThrownBy(key::copyMaterial).isInstanceOf(IntegrityException.class);
     }
   }
 
@@ -121,97 +127,106 @@ class HmacIntegrityTest {
     @Test
     @DisplayName("checks that signing produces the same output as Java's signing")
     void signMatchesJavaReference() throws Exception {
-      HmacIntegrity.Key key = HmacIntegrity.Key.of(KEY_MATERIAL);
+      try (HmacIntegrity.Key key = HmacIntegrity.Key.of(KEY_MATERIAL)) {
 
-      try {
         for (HmacIntegrity.Algorithm algorithm : HmacIntegrity.Algorithm.values()) {
           byte[] expected = referenceHmac(algorithm, KEY_MATERIAL, MESSAGE);
-          byte[] actual = HmacIntegrity.sign(algorithm, key, MESSAGE);
+          byte[] actual = HmacIntegrity.sign(key, MESSAGE, algorithm);
 
           assertThat(actual)
               .withFailMessage("Mismatched tags for %s", algorithm)
               .containsExactly(expected);
         }
-      } finally {
-        key.close();
       }
     }
 
     @Test
     @DisplayName("ensures that the produced tags are of the correct length for each algorithm.")
     void signProducesExpectedTagLengths() {
-      HmacIntegrity.Key key = HmacIntegrity.Key.of(KEY_MATERIAL);
+      try (HmacIntegrity.Key key = HmacIntegrity.Key.of(KEY_MATERIAL)) {
+        assertThat(HmacIntegrity.sign(key, MESSAGE, HmacIntegrity.Algorithm.SHA256)).hasSize(32);
 
-      try {
-        assertThat(HmacIntegrity.sign(HmacIntegrity.Algorithm.SHA256, key, MESSAGE)).hasSize(32);
+        assertThat(HmacIntegrity.sign(key, MESSAGE, HmacIntegrity.Algorithm.SHA384)).hasSize(48);
 
-        assertThat(HmacIntegrity.sign(HmacIntegrity.Algorithm.SHA384, key, MESSAGE)).hasSize(48);
-
-        assertThat(HmacIntegrity.sign(HmacIntegrity.Algorithm.SHA512, key, MESSAGE)).hasSize(64);
-      } finally {
-        key.close();
+        assertThat(HmacIntegrity.sign(key, MESSAGE, HmacIntegrity.Algorithm.SHA512)).hasSize(64);
       }
     }
 
     @Test
-    @DisplayName("ensures that signing fails when the key is null")
-    void signingRequiresKey() {
-      assertThatThrownBy(() -> HmacIntegrity.sign(HmacIntegrity.Algorithm.SHA256, null, MESSAGE))
-          .isInstanceOf(NullPointerException.class);
+    @DisplayName("rejects null signing arguments")
+    void signingRequiresNonNullArguments() {
+      try (HmacIntegrity.Key key = HmacIntegrity.Key.of(KEY_MATERIAL)) {
+
+        assertThatThrownBy(() -> HmacIntegrity.sign(null, MESSAGE))
+            .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> HmacIntegrity.sign(key, null))
+            .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> HmacIntegrity.sign(key, MESSAGE, null))
+            .isInstanceOf(IllegalArgumentException.class);
+      }
     }
 
     @Test
     @DisplayName("checks a full round trip, ensuring that produced tags can be verified")
     void verificationSucceedsForValidTag() {
-      HmacIntegrity.Key key = HmacIntegrity.Key.of(KEY_MATERIAL);
+      try (HmacIntegrity.Key key = HmacIntegrity.Key.of(KEY_MATERIAL)) {
 
-      try {
         for (HmacIntegrity.Algorithm algorithm : HmacIntegrity.Algorithm.values()) {
-          byte[] tag = HmacIntegrity.sign(algorithm, key, MESSAGE);
+          byte[] tag = HmacIntegrity.sign(key, MESSAGE, algorithm);
 
-          assertThat(HmacIntegrity.verify(algorithm, key, MESSAGE, tag))
+          assertThat(HmacIntegrity.verify(key, MESSAGE, tag, algorithm))
               .withFailMessage("Correct tag was rejected for algorithm %s", algorithm)
               .isTrue();
         }
-      } finally {
-        key.close();
       }
     }
 
     @Test
     @DisplayName("ensures that a modified message fails verification")
     void verifyFailsForModifiedMessage() {
-      HmacIntegrity.Key key = HmacIntegrity.Key.of(KEY_MATERIAL);
+      try (HmacIntegrity.Key key = HmacIntegrity.Key.of(KEY_MATERIAL)) {
 
-      try {
-        byte[] tag = HmacIntegrity.sign(HmacIntegrity.Algorithm.SHA256, key, MESSAGE);
-
+        byte[] tag = HmacIntegrity.sign(key, MESSAGE);
         byte[] modifiedMessage = MESSAGE.clone();
         modifiedMessage[0] = '!'; // was 'T'
 
-        assertThat(HmacIntegrity.verify(HmacIntegrity.Algorithm.SHA256, key, modifiedMessage, tag))
-            .isFalse();
-      } finally {
-        key.close();
+        assertThat(HmacIntegrity.verify(key, modifiedMessage, tag)).isFalse();
+      }
+    }
+
+    @Test
+    @DisplayName("ensures that verification with the wrong key")
+    void verifyFailsForIncorrectKey() {
+      try (HmacIntegrity.Key goodKey = HmacIntegrity.Key.of(KEY_MATERIAL);
+          HmacIntegrity.Key badKey = HmacIntegrity.generateKey()) {
+
+        byte[] tag = HmacIntegrity.sign(goodKey, MESSAGE);
+
+        assertThat(HmacIntegrity.verify(badKey, MESSAGE, tag)).isFalse();
       }
     }
 
     @Test
     @DisplayName("ensures that verification only accepts tags of the expected length")
     void verifyFailsWithWrongTagLength() {
-      HmacIntegrity.Key key = HmacIntegrity.Key.of(KEY_MATERIAL);
+      try (HmacIntegrity.Key key = HmacIntegrity.Key.of(KEY_MATERIAL)) {
+        assertThatThrownBy(
+                () ->
+                    HmacIntegrity.verify(
+                        key, MESSAGE, new byte[31], HmacIntegrity.Algorithm.SHA256))
+            .isInstanceOf(IllegalArgumentException.class);
 
-      try {
-        assertThat(HmacIntegrity.verify(HmacIntegrity.Algorithm.SHA256, key, MESSAGE, new byte[31]))
-            .isFalse();
+        assertThatThrownBy(
+                () ->
+                    HmacIntegrity.verify(
+                        key, MESSAGE, new byte[32], HmacIntegrity.Algorithm.SHA384))
+            .isInstanceOf(IllegalArgumentException.class);
 
-        assertThat(HmacIntegrity.verify(HmacIntegrity.Algorithm.SHA384, key, MESSAGE, new byte[32]))
-            .isFalse();
-
-        assertThat(HmacIntegrity.verify(HmacIntegrity.Algorithm.SHA512, key, MESSAGE, new byte[48]))
-            .isFalse();
-      } finally {
-        key.close();
+        assertThatThrownBy(
+                () ->
+                    HmacIntegrity.verify(
+                        key, MESSAGE, new byte[48], HmacIntegrity.Algorithm.SHA512))
+            .isInstanceOf(IllegalArgumentException.class);
       }
     }
 
@@ -223,8 +238,8 @@ class HmacIntegrityTest {
       key.close();
 
       // should occur during copyMaterial
-      assertThatThrownBy(() -> HmacIntegrity.sign(HmacIntegrity.Algorithm.SHA256, key, MESSAGE))
-          .isInstanceOf(IllegalStateException.class);
+      assertThatThrownBy(() -> HmacIntegrity.sign(key, MESSAGE, HmacIntegrity.Algorithm.SHA256))
+          .isInstanceOf(IntegrityException.class);
     }
   }
 }
